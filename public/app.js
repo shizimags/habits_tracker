@@ -766,6 +766,7 @@ view.addEventListener('change', e => {
 // Google, their state is loaded from / saved to Netlify DB (one row per Google
 // account), so it persists and follows them across devices. Last write wins.
 const CLIENT_ID = window.GOOGLE_CLIENT_ID || '';
+const AUTH_KEY = 'habit-tracker-auth-v1';
 const AUTH = { token: null, user: null, sync: 'idle', syncError: '' };
 let cloudPushTimer = null;
 let tokenRefreshTimer = null;
@@ -780,6 +781,55 @@ const TOKEN_REFRESH_INTERVAL_MS = 45 * 60 * 1000; // well under the ~60min token
 
 function decodeJwt(t) {
   try { return JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch (e) { return null; }
+}
+// The session must survive page refreshes: keep the token + user in
+// localStorage and restore them on boot. Without this, every reload threw the
+// in-memory session away and gambled on Google One Tap silently re-signing in,
+// which browsers frequently suppress (cooldowns, Safari/ITP) — showing the
+// user a spurious "signed out" screen.
+function persistAuth() {
+  try { localStorage.setItem(AUTH_KEY, JSON.stringify({ token: AUTH.token, user: AUTH.user })); } catch (e) {}
+}
+function clearPersistedAuth() {
+  try { localStorage.removeItem(AUTH_KEY); } catch (e) {}
+}
+function tokenValid(token) {
+  const p = token && decodeJwt(token);
+  return !!(p && p.exp && p.exp * 1000 > Date.now() + 60000); // 60s safety margin
+}
+function restoreSession() {
+  let stored = null;
+  try { stored = JSON.parse(localStorage.getItem(AUTH_KEY)); } catch (e) {}
+  if (!stored || !stored.user) return;
+  AUTH.user = stored.user;
+  if (tokenValid(stored.token)) {
+    AUTH.token = stored.token;
+    AUTH.sync = 'synced';
+    startTokenRefreshTimer();
+    cloudPull(); // refresh from cloud in the background (e.g. edits from another device)
+  } else {
+    // Token expired while the app was closed: show "Reconnecting…" and wait —
+    // initGoogle() will silently request a fresh token once the Google script
+    // is up (mode 'pull', so the fresh sign-in loads the cloud copy rather
+    // than pushing possibly-stale local data). Never touches local data.
+    AUTH.sync = 'error';
+    AUTH.syncError = 'Reconnecting…';
+    nextCredentialMode = 'pull';
+  }
+}
+// If a reconnect attempt goes unanswered (no Google session, dismissed prompt),
+// drop to the signed-out card after a grace period — without clearing data.
+function armAuthFallback() {
+  const staleUser = AUTH.user;
+  clearTimeout(authExpiredFallbackTimer);
+  authExpiredFallbackTimer = setTimeout(() => {
+    if (AUTH.user === staleUser && !AUTH.token) {
+      AUTH.user = null;
+      stopTokenRefreshTimer();
+      clearPersistedAuth();
+      setSync('idle');
+    }
+  }, 8000);
 }
 function setSync(state, err) {
   AUTH.sync = state;
@@ -825,6 +875,7 @@ async function onGoogleCredential(resp) {
   clearTimeout(authExpiredFallbackTimer);
   AUTH.token = resp.credential;
   AUTH.user = { email: payload.email, name: payload.name };
+  persistAuth();
   startTokenRefreshTimer();
   if (mode === 'pull') {
     await cloudPull();
@@ -857,15 +908,16 @@ function stopTokenRefreshTimer() {
 // the sync; only fall back to showing "signed out" if that truly fails, and
 // even then nothing local is cleared (that only happens on the explicit
 // Sign Out button, see signOutAndClearLocal).
-function handleAuthExpired() {
+function handleAuthExpired(mode = 'refresh') {
   const staleUser = AUTH.user;
   setSync('error', 'Session expired — reconnecting…');
-  const attempted = refreshTokenSilently('refresh');
+  const attempted = refreshTokenSilently(mode);
   clearTimeout(authExpiredFallbackTimer);
   authExpiredFallbackTimer = setTimeout(() => {
     if (AUTH.user === staleUser && AUTH.sync === 'error') {
       AUTH.token = null; AUTH.user = null;
       stopTokenRefreshTimer();
+      clearPersistedAuth();
       setSync('idle');
     }
   }, attempted ? 8000 : 0);
@@ -879,6 +931,7 @@ async function signOutAndClearLocal() {
   AUTH.user = null;
   AUTH.sync = 'idle';
   AUTH.syncError = '';
+  clearPersistedAuth();
   stopTokenRefreshTimer();
   if (window.google && window.google.accounts) window.google.accounts.id.disableAutoSelect();
   DB = { pastSummaries: {}, months: {} };
@@ -891,7 +944,13 @@ async function signOutAndClearLocal() {
 function initGoogle() {
   if (!(window.google && window.google.accounts && window.google.accounts.id) || !CLIENT_ID) return;
   google.accounts.id.initialize({ client_id: CLIENT_ID, callback: onGoogleCredential, auto_select: true });
-  google.accounts.id.prompt();   // silent re-sign-in for returning users
+  // Only nudge Google when we actually need a token: a restored session that
+  // expired while the app was closed. A valid restored session needs nothing,
+  // and a signed-out user gets the explicit button instead of a popup.
+  if (AUTH.user && !AUTH.token) {
+    google.accounts.id.prompt();
+    armAuthFallback();
+  }
   updateAccountUI();
 }
 window.__gisOnLoad = initGoogle;
@@ -928,6 +987,7 @@ loadDB().then(() => {
     const keys = monthKeysSorted();
     if (keys.length) { S.ym = keys[keys.length - 1]; S.day = daysInMonth(S.ym); }
   }
+  restoreSession();  // stay signed in across refreshes
   render();
   initGoogle();
 });
