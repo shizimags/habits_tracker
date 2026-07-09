@@ -663,7 +663,7 @@ const CLICKS = {
   'goto-plan': { keep: false, run: () => { S.tab = 'plan'; } },
   'backup': { keep: true, run: backup, skipRender: true },
   'restore': { keep: true, run: () => view.querySelector('[data-role="restore-input"]').click(), skipRender: true },
-  'signout': { keep: true, run: signOut }
+  'signout': { keep: false, run: signOut }
 };
 
 // Live field edits (text/number in the add form) — keep S.form current so the
@@ -774,7 +774,17 @@ async function onGoogleCredential(resp) {
 function signOut() {
   AUTH.token = null;
   AUTH.user = null;
+  AUTH.sync = 'idle';
+  AUTH.syncError = '';
   if (window.google && window.google.accounts) window.google.accounts.id.disableAutoSelect();
+  // A signed-in account's data lives in the cloud; the local copy is just a
+  // cache for that account. Clear it on sign-out so goals don't linger on
+  // screen (or silently get adopted into) the next account signed in here.
+  DB = { pastSummaries: {}, months: {} };
+  saveLocal();
+  S.ym = TODAY_YM; S.day = TODAY_D;
+  S.gridYM = null; S.planYM = null; S.draft = null; S.planMsg = '';
+  S.form = blankForm();
 }
 function initGoogle() {
   if (!(window.google && window.google.accounts && window.google.accounts.id) || !CLIENT_ID) return;
