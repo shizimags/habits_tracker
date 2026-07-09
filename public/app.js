@@ -95,7 +95,9 @@ const S = {
   ym: TODAY_YM, day: TODAY_D,   // Daily Log cursor
   gridYM: null,                 // Monthly Log cursor
   planYM: null, draft: null, planMsg: '',
-  form: blankForm()
+  form: blankForm(),
+  onboard: null,                // active onboarding wizard state, or null
+  onboardDismissed: false       // user opted out this session — don't re-show
 };
 
 // ---------- Rendering ----------
@@ -106,6 +108,7 @@ const RENDERERS = { log: renderLog, grid: renderGrid, plan: renderPlan, year: re
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
 function render(keepScroll = false) {
+  if (S.onboard) { renderOnboard(); view.scrollTop = 0; return; }
   for (const btn of tabbar.children) btn.classList.toggle('active', btn.dataset.tab === S.tab);
   const scroll = view.scrollTop;
   (RENDERERS[S.tab] || renderLog)();
@@ -601,9 +604,143 @@ async function deleteAllData() {
   render();
 }
 
+// ---------- ONBOARDING ----------
+// Five quick questions for a signed-in user with no months yet. Every answer
+// maps straight onto the existing data model; skipping a question creates
+// nothing. Ends with an optional quote and a review before the month is built.
+const OB_QUESTIONS = [
+  { key: 'walk',    title: 'Do you want to track your walks?', sub: 'A simple check for the days you get out.',
+    make: a => ({ id: 'walk', name: 'Walk', cat: 'Move', type: 'check', goal: a.goal }),
+    fields: [{ f: 'goal', label: 'days a month', def: 10 }] },
+  { key: 'workout', title: 'Do you work out — gym, sports, or a class?', sub: 'Counts any kind of workout day.',
+    make: a => ({ id: 'workout', name: 'Workout', cat: 'Move', type: 'check', goal: a.goal }),
+    fields: [{ f: 'goal', label: 'days a month', def: 8 }] },
+  { key: 'cook',    title: 'Do you cook your own food?', sub: 'Days you cook instead of ordering.',
+    make: a => ({ id: 'cook-food', name: 'Cook food', cat: 'Food', type: 'check', goal: a.goal }),
+    fields: [{ f: 'goal', label: 'days a month', def: 12 }] },
+  { key: 'water',   title: 'Want to track drinking water daily?', sub: 'A day counts when you hit your glasses target.',
+    make: a => ({ id: 'water', name: 'Water', cat: 'Health', type: 'qty', target: a.target, goal: a.goal }),
+    fields: [{ f: 'target', label: 'glasses a day', def: 8 }, { f: 'goal', label: 'days a month', def: 25 }] },
+  { key: 'cutback', title: 'Is there something you’re cutting back on?', sub: 'Cigarettes, coffee, soda… count each one and stay under a daily limit.',
+    counter: true,
+    fields: [{ f: 'name', label: 'what is it? (e.g. Coffee)', def: '', text: true },
+             { f: 'under', label: 'keep it under — a day', def: 5 },
+             { f: 'goal', label: 'days a month', def: 20 }] }
+];
+
+function startOnboarding() {
+  const a = {};
+  for (const q of OB_QUESTIONS) {
+    a[q.key] = {};
+    for (const f of q.fields) a[q.key][f.f] = f.def;
+  }
+  S.onboard = { step: 0, a, accepted: {}, quote: '' };
+}
+function maybeStartOnboarding() {
+  if (AUTH.user && !Object.keys(DB.months).length && !S.onboard && !S.onboardDismissed) {
+    startOnboarding();
+    render();
+  }
+}
+// Build the current month from accepted answers.
+function createOnboardMonth() {
+  const ob = S.onboard;
+  const habits = [], counters = [];
+  for (const q of OB_QUESTIONS) {
+    if (!ob.accepted[q.key]) continue;
+    const a = ob.a[q.key];
+    if (q.counter) {
+      const name = (a.name || '').trim();
+      const under = Math.max(1, Number(a.under) || 1);
+      if (!name) continue;
+      counters.push({ id: 'c-' + Date.now(), name, unit: 'times', days: {},
+        tiers: [{ id: 'u' + under, label: 'Under ' + under, max: under - 1, goal: Math.max(0, Number(a.goal) || 0) }] });
+    } else {
+      habits.push({ ...q.make(a), days: {} });
+    }
+  }
+  DB.months[TODAY_YM] = { quote: (ob.quote || '').trim(), notes: '', habits, counters };
+  save();
+  S.onboard = null;
+  S.tab = 'log';
+  S.ym = TODAY_YM; S.day = TODAY_D;
+}
+
+function renderOnboard() {
+  const ob = S.onboard;
+  const total = OB_QUESTIONS.length + 2; // questions + quote + review
+  const dots = Array.from({ length: total }, (_, i) =>
+    `<span class="ob-dot ${i === ob.step ? 'on' : i < ob.step ? 'done' : ''}"></span>`).join('');
+
+  let body;
+  if (ob.step < OB_QUESTIONS.length) {
+    const q = OB_QUESTIONS[ob.step];
+    const a = ob.a[q.key];
+    const inputs = q.fields.map(f => f.text
+      ? `<div class="ob-field"><input type="text" data-field="ob-input" data-q="${q.key}" data-f="${f.f}" placeholder="${esc(f.label)}" value="${esc(a[f.f])}"></div>`
+      : `<div class="ob-field"><input type="number" data-field="ob-input" data-q="${q.key}" data-f="${f.f}" value="${a[f.f]}"><span class="hint">${esc(f.label)}</span></div>`
+    ).join('');
+    body = `<div class="ob-card">
+      <div class="ob-title">${esc(q.title)}</div>
+      <div class="ob-sub">${esc(q.sub)}</div>
+      ${inputs}
+      <div class="ob-actions">
+        <button class="btn-skip" data-action="ob-skip">Skip</button>
+        <button class="cta" data-action="ob-yes">Yes, add it →</button>
+      </div>
+      ${ob.step === 0 ? `<button class="ob-skip-all" data-action="ob-skip-all">Skip all — I’ll set up manually</button>` : ''}
+    </div>`;
+  } else if (ob.step === OB_QUESTIONS.length) {
+    body = `<div class="ob-card">
+      <div class="ob-title">Pick a quote for your month</div>
+      <div class="ob-sub">Optional — it shows at the top of your Daily Log.</div>
+      <div class="ob-field"><input type="text" data-field="ob-quote" placeholder="e.g. Peace follows Chaos" value="${esc(ob.quote)}"></div>
+      <div class="ob-actions">
+        <button class="btn-skip" data-action="ob-next">Skip</button>
+        <button class="cta" data-action="ob-next">Next →</button>
+      </div>
+    </div>`;
+  } else {
+    const items = [];
+    for (const q of OB_QUESTIONS) {
+      if (!ob.accepted[q.key]) continue;
+      const a = ob.a[q.key];
+      if (q.counter) {
+        if ((a.name || '').trim()) items.push({ key: q.key, label: `${a.name.trim()} — keep under ${a.under} a day, ${a.goal} days` });
+      } else if (q.key === 'water') {
+        items.push({ key: q.key, label: `Water — ${a.target} glasses a day, ${a.goal} days` });
+      } else {
+        items.push({ key: q.key, label: `${q.make(a).name} — ${a.goal} days a month` });
+      }
+    }
+    body = `<div class="ob-card">
+      <div class="ob-title">Here’s your ${esc(monthLabel(TODAY_YM))} plan</div>
+      <div class="ob-sub">${items.length ? 'Remove anything you don’t want — you can always change goals later.' : 'Nothing selected — you can still create the month and add habits in Goals.'}</div>
+      ${items.map(it => `<div class="ob-item"><span>${esc(it.label)}</span><button class="ob-remove" data-action="ob-remove" data-key="${it.key}">✕</button></div>`).join('')}
+      ${ob.quote ? `<div class="ob-quote">“${esc(ob.quote)}”</div>` : ''}
+      <div class="ob-actions">
+        <button class="btn-skip" data-action="ob-back">← Back</button>
+        <button class="cta" data-action="ob-create">Create ${esc(monthLabel(TODAY_YM))} →</button>
+      </div>
+    </div>`;
+  }
+
+  view.innerHTML = `<div class="screen ob-screen">
+    <div class="ob-dots">${dots}</div>
+    ${body}
+  </div>`;
+}
+
 // Click actions. `keep` = re-render preserving scroll position (in-place edits);
 // omitted = re-render from the top (navigation between contexts).
 const CLICKS = {
+  'ob-yes': { keep: false, run: () => { const q = OB_QUESTIONS[S.onboard.step]; if (q.counter && !(S.onboard.a[q.key].name || '').trim()) return; S.onboard.accepted[q.key] = true; S.onboard.step++; } },
+  'ob-skip': { keep: false, run: () => { S.onboard.step++; } },
+  'ob-next': { keep: false, run: () => { S.onboard.step++; } },
+  'ob-back': { keep: false, run: () => { S.onboard.step = Math.max(0, S.onboard.step - 1); } },
+  'ob-remove': { keep: true, run: el => { delete S.onboard.accepted[el.dataset.key]; } },
+  'ob-skip-all': { keep: false, run: () => { S.onboard = null; S.onboardDismissed = true; S.tab = 'plan'; } },
+  'ob-create': { keep: false, run: createOnboardMonth },
   'day-prev': { keep: false, run: () => { if (S.day > 1) S.day--; else { const p = prevYM(S.ym); if (DB.months[p]) { S.ym = p; S.day = daysInMonth(p); } } } },
   'day-next': { keep: false, run: () => { if (isToday(S.ym, S.day)) return; if (S.day < daysInMonth(S.ym)) S.day++; else { const n = nextYM(S.ym); if (DB.months[n]) { S.ym = n; S.day = 1; } } } },
   'chip-tap': { keep: true, run: el => tapHabit(S.ym, el.dataset.hid, S.day) },
@@ -633,6 +770,8 @@ const CLICKS = {
 // Live field edits (text/number in the add form) — keep S.form current so the
 // Add button never has to read the DOM.
 const FIELDS = {
+  'ob-input': (v, el) => { const a = S.onboard && S.onboard.a[el.dataset.q]; if (a) a[el.dataset.f] = el.type === 'number' ? Math.max(0, Number(v) || 0) : v; },
+  'ob-quote': v => { if (S.onboard) S.onboard.quote = v; },
   'form-name': v => { S.form.name = v; },
   'form-unit': v => { S.form.unit = v; },
   'form-limits': v => { S.form.limits = v; },
@@ -657,6 +796,7 @@ const CHANGES = {
 tabbar.addEventListener('click', e => {
   const btn = e.target.closest('.tab');
   if (!btn) return;
+  if (S.onboard) { S.onboard = null; S.onboardDismissed = true; } // tab tap = opt out of the wizard
   S.tab = btn.dataset.tab;
   S.planMsg = '';
   render();
@@ -726,7 +866,7 @@ function restoreSession() {
     AUTH.token = stored.token;
     AUTH.sync = 'synced';
     startTokenRefreshTimer();
-    cloudPull(); // refresh from cloud in the background (e.g. edits from another device)
+    cloudPull().then(maybeStartOnboarding); // background refresh; guided setup if the account is empty
   } else {
     // Token expired while the app was closed: show "Reconnecting…" and wait —
     // initGoogle() will silently request a fresh token once the Google script
@@ -799,6 +939,7 @@ async function onGoogleCredential(resp) {
   startTokenRefreshTimer();
   if (mode === 'pull') {
     await cloudPull();
+    maybeStartOnboarding(); // brand-new account (no months anywhere) → guided setup
   } else {
     // Background token renewal — data is untouched; just let any save that
     // was waiting on a valid token go through now.
