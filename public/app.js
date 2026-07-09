@@ -12,7 +12,6 @@
 
 // ---------- Constants ----------
 const LS_KEY = 'habit-tracker-2026-v1';
-const OLD_LS_KEY = 'habitTracker2026';
 const YEAR = 2026;
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const CAT_ORDER = ['Move', 'Health', 'Food', 'Avoidance', 'Home', 'Work & Soul'];
@@ -22,7 +21,6 @@ const DOT_CELL = 26;
 const ACCENT = '#3E7A5B', GOOD = '#2E7D52', AMBER = '#B98A2E', RED = '#B4554A';
 const BAR_MID = '#C9A961', BAR_LOW = '#C99B94';
 const DEFAULT_TIER_LIMITS = '10,7,3,0';
-const DEFAULT_TIERS = tiersFromLimits(DEFAULT_TIER_LIMITS.split(','));
 const MILESTONE_THRESHOLDS = [50, 100, 200, 500, 1000, 3000];
 
 // ---------- Date helpers ----------
@@ -75,88 +73,11 @@ function normalizeDB(db) {
   return db;
 }
 
-// ---------- Migration from the pre-redesign app format ----------
-const OLD_HABIT_MAP = {
-  'hike': ['Hike', 'Move'], 'bike': ['Bike', 'Move'], 'walk': ['Walk', 'Move'], 'swim': ['Swim', 'Move'], 'ski': ['Ski', 'Move'],
-  'soccer': ['Soccer', 'Move'], 'soccer 💪': ['Soccer', 'Move'],
-  'cgc': ['CGC / Gym', 'Move'], 'cgc 🏃': ['CGC / Gym', 'Move'], 'cgc/gym': ['CGC / Gym', 'Move'],
-  'workout/ activity': ['Workout / Activity', 'Move'],
-  'go for a walk/run': ['Go for a Walk / Run', 'Move'], 'go for a walk/run/hike': ['Go for a Walk / Run', 'Move'],
-  'eat meds morning': ['Meds — morning', 'Health'], 'eat meds evening': ['Meds — evening', 'Health'],
-  'brush teeth morning': ['Brush teeth — AM', 'Health'], 'brush teeth morning 🪥': ['Brush teeth — AM', 'Health'],
-  'brush teeth evening': ['Brush teeth — PM', 'Health'], 'brush teeth evening 🪥': ['Brush teeth — PM', 'Health'],
-  'wake up < 8:30 am': ['Wake up before 8:30', 'Health'], 'wake up 8:30 am 🕑': ['Wake up before 8:30', 'Health'],
-  'wake up < 7:00 am': ['Wake up before 7:00', 'Health'],
-  'drink electrolyte': ['Drink electrolyte', 'Health'],
-  'drink water- morning': ['Water — morning', 'Health'], 'drink water- evening': ['Water — evening', 'Health'],
-  'drink 1 bottle of water': ['Drink 1 bottle of water', 'Health'],
-  'cook food': ['Cook food', 'Food'],
-  'no uber eats': ['No Uber Eats', 'Avoidance'], 'no chocolate': ['No chocolate', 'Avoidance'],
-  'no sugar': ['No sugar', 'Avoidance'], 'no junk food': ['No junk food', 'Avoidance'],
-  'clean room': ['Clean room', 'Home'], 'change towel': ['Change towel', 'Home'], 'change sheets': ['Change sheets', 'Home'],
-  'li post': ['LinkedIn post', 'Work & Soul'], 'li post 📖': ['LinkedIn post', 'Work & Soul'],
-  'offer prayers': ['Offer prayers', 'Work & Soul']
-};
-function mapOldHabit(name) {
-  const key = name.trim().toLowerCase();
-  if (OLD_HABIT_MAP[key]) return { name: OLD_HABIT_MAP[key][0], cat: OLD_HABIT_MAP[key][1], type: 'check' };
-  let m = key.match(/^(\d+)\s+pushups$/); if (m) return { name: 'Pushups', cat: 'Move', type: 'qty', target: +m[1] };
-  m = key.match(/^(\d+)\s+crunches$/); if (m) return { name: 'Crunches', cat: 'Move', type: 'qty', target: +m[1] };
-  if (key.includes('hvn')) return { name: 'Work on HVN', cat: 'Work & Soul', type: 'time', target: 60 };
-  if (key === 'fill habit tracker' || key === 'next month prefill') return null;
-  return { name: name.trim(), cat: 'Work & Soul', type: 'check' };
-}
-function oldSmokeTier(name) {
-  const n = name.trim().toLowerCase();
-  const m = n.match(/^smoke\s*<\s*(\d+)/);
-  if (m) return { max: +m[1] - 1, label: 'Under ' + m[1] };
-  if (n.startsWith('no smoke')) return { max: 0, label: 'Zero' };
-  return null;
-}
-function slug(name) { return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''); }
-function migrateOld(old) {
-  const out = { pastSummaries: {}, months: {} };
-  for (const mk of Object.keys(old.months).sort()) {
-    const m = old.months[mk];
-    if (mk < ymOf(YEAR, 7)) { // months before the first full-detail month collapse to summaries
-      out.pastSummaries[mk] = {
-        done: m.habits.reduce((s, h) => s + Object.keys(h.checks).length, 0),
-        goal: m.habits.reduce((s, h) => s + h.goal, 0)
-      };
-      continue;
-    }
-    const habits = [], tiers = DEFAULT_TIERS.map(t => ({ ...t })), days = {};
-    for (const h of m.habits) {
-      const tier = oldSmokeTier(h.name);
-      if (tier) {
-        let hit = tiers.find(x => x.max === tier.max);
-        if (!hit) { hit = { id: 'u' + (tier.max + 1), label: tier.label, max: tier.max, goal: 0 }; tiers.push(hit); tiers.sort((a, b) => b.max - a.max); }
-        hit.goal = h.goal;
-        for (const dk of Object.keys(h.checks)) days[dk] = days[dk] == null ? tier.max : Math.min(days[dk], tier.max);
-        continue;
-      }
-      const mapped = mapOldHabit(h.name);
-      if (!mapped) continue;
-      const hDays = {};
-      for (const dk of Object.keys(h.checks)) hDays[dk] = mapped.type === 'check' ? 1 : mapped.target;
-      habits.push({ id: slug(mapped.name), name: mapped.name, cat: mapped.cat, type: mapped.type, goal: h.goal, days: hDays, ...(mapped.target ? { target: mapped.target } : {}) });
-    }
-    Object.assign(days, m.smokeCounts || {});
-    out.months[mk] = { quote: m.quote || '', notes: m.notes || '', habits, counters: [{ id: 'smoke', name: 'Smoking', unit: 'cigarettes', days, tiers }] };
-  }
-  return out;
-}
-
 let DB = null;
 function saveLocal() { try { localStorage.setItem(LS_KEY, JSON.stringify(DB)); } catch (e) {} }
 function save() { saveLocal(); scheduleCloudPush(); }
 async function loadDB() {
   try { DB = JSON.parse(localStorage.getItem(LS_KEY)); } catch (e) {}
-  if (!DB) {
-    let old = null;
-    try { old = JSON.parse(localStorage.getItem(OLD_LS_KEY)); } catch (e) {}
-    if (old && old.months) DB = migrateOld(old);
-  }
   if (!DB) DB = { pastSummaries: {}, months: {} };  // fresh install starts empty
   DB = normalizeDB(DB);
   save();
@@ -183,7 +104,6 @@ const tabbar = document.getElementById('tabbar');
 const RENDERERS = { log: renderLog, grid: renderGrid, plan: renderPlan, year: renderYear };
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
-function attr(obj) { return Object.entries(obj).filter(([, v]) => v != null).map(([k, v]) => `${k}="${esc(v)}"`).join(' '); }
 
 function render(keepScroll = false) {
   for (const btn of tabbar.children) btn.classList.toggle('active', btn.dataset.tab === S.tab);
@@ -909,18 +829,10 @@ function stopTokenRefreshTimer() {
 // even then nothing local is cleared (that only happens on the explicit
 // Sign Out button, see signOutAndClearLocal).
 function handleAuthExpired(mode = 'refresh') {
-  const staleUser = AUTH.user;
+  AUTH.token = null; // token is dead after a 401; onGoogleCredential re-sets it
   setSync('error', 'Session expired — reconnecting…');
-  const attempted = refreshTokenSilently(mode);
-  clearTimeout(authExpiredFallbackTimer);
-  authExpiredFallbackTimer = setTimeout(() => {
-    if (AUTH.user === staleUser && AUTH.sync === 'error') {
-      AUTH.token = null; AUTH.user = null;
-      stopTokenRefreshTimer();
-      clearPersistedAuth();
-      setSync('idle');
-    }
-  }, attempted ? 8000 : 0);
+  refreshTokenSilently(mode);
+  armAuthFallback();
 }
 // The explicit "Sign out" button: flush any pending edits to the cloud first
 // (so nothing typed just before signing out is lost), then clear local data —
