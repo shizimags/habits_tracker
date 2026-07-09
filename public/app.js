@@ -988,6 +988,10 @@ loadDB().then(() => {
     if (keys.length) { S.ym = keys[keys.length - 1]; S.day = daysInMonth(S.ym); }
   }
   restoreSession();  // stay signed in across refreshes
+  // First launch (no session, no data): land on Journey so the Google sign-in
+  // card is front and center — signing in there restores any cloud data.
+  // Local-only users with existing data still land on the Daily Log.
+  if (!AUTH.user && !Object.keys(DB.months).length) S.tab = 'year';
   render();
   initGoogle();
 });
