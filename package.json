@@ -6,6 +6,7 @@
   "description": "2026 Habit Tracker — local-first PWA with Google Sign-In and Netlify DB sync",
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
+    "@netlify/database": "^1.1.0",
     "google-auth-library": "^9.14.1"
   }
 }

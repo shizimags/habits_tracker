@@ -1,4 +1,5 @@
 import { neon } from '@neondatabase/serverless';
+import { getConnectionString } from '@netlify/database';
 import { OAuth2Client } from 'google-auth-library';
 
 // The Google client ID doubles as the token audience. Public value; falls back
@@ -8,22 +9,12 @@ const CLIENT_ID = process.env.GOOGLE_CLIENT_ID
 
 const oauth = new OAuth2Client(CLIENT_ID);
 
-// Lazily connect so a missing env var yields a clean JSON error instead of a
-// 502 crash at module load. Netlify DB exposes both the pooled and unpooled URL.
-// Netlify DB has exposed this connection string under a couple of different
-// var names across rollouts; accept any of them rather than guessing wrong.
-const DB_URL_VARS = ['NETLIFY_DATABASE_URL', 'NETLIFY_DATABASE_URL_UNPOOLED', 'DATABASE_URL', 'NEON_DATABASE_URL'];
-function findDbUrl() {
-  for (const name of DB_URL_VARS) if (process.env[name]) return { name, url: process.env[name] };
-  return null;
-}
+// Netlify Database exposes its connection string as NETLIFY_DB_URL, not the
+// more guessable NETLIFY_DATABASE_URL. @netlify/database's getConnectionString()
+// resolves it correctly across Netlify's runtimes instead of reading process.env directly.
 let _sql, _schema;
 function db() {
-  if (!_sql) {
-    const found = findDbUrl();
-    if (!found) throw new Error('No database URL env var found (checked ' + DB_URL_VARS.join(', ') + ') — is Netlify DB linked to this site?');
-    _sql = neon(found.url);
-  }
+  if (!_sql) _sql = neon(getConnectionString());
   return _sql;
 }
 function ensureSchema() {
