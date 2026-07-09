@@ -40,6 +40,7 @@ function dayOfYear(ym, day) { const [y, m] = ym.split('-').map(Number); return M
 function metVal(h, v) { return h.type === 'check' ? !!v : (v || 0) >= h.target; }
 function habitActual(h) { return Object.values(h.days).filter(v => metVal(h, v)).length; }
 function activeHabits(m) { return m.habits.filter(h => !h.archived); }
+function activeTiers(c) { return c.tiers.filter(t => !t.archived); }
 function tierMetDays(c, t) { return Object.values(c.days).filter(v => v <= t.max).length; }
 function pctColor(p) { return p >= 80 ? GOOD : p >= 50 ? AMBER : RED; }
 function pct(done, goal) { return goal ? Math.round((done / goal) * 100) : 0; }
@@ -55,7 +56,7 @@ function monthStats(ym) {
   if (!m) return null;
   let done = 0, goal = 0;
   for (const h of activeHabits(m)) { done += habitActual(h); goal += h.goal; }
-  for (const c of m.counters) for (const t of c.tiers) { goal += t.goal; done += Math.min(tierMetDays(c, t), t.goal); }
+  for (const c of m.counters) for (const t of activeTiers(c)) { goal += t.goal; done += Math.min(tierMetDays(c, t), t.goal); }
   return { done, goal, rate: goal ? done / goal : 0 };
 }
 
@@ -245,7 +246,7 @@ function renderLog() {
 
   const counters = m.counters.map(c => {
     const cv = c.days[day], has = cv != null;
-    const tiers = c.tiers.map(t => {
+    const tiers = activeTiers(c).map(t => {
       const met = has && cv <= t.max;
       const tally = t.goal ? `${tierMetDays(c, t)}/${t.goal}d` : `${tierMetDays(c, t)}d`;
       return `<div class="tier-chip ${met ? 'met' : ''}">${met ? '✓' : '·'} ${esc(t.label)} <span>${tally}</span></div>`;
@@ -327,7 +328,7 @@ function renderGrid() {
     rows.push(`<div class="grid-row"><div class="grid-name"><div class="nm">${esc(h.name)}</div>
       <div class="sb" style="color:${pctColor(p)}">${act}/${h.goal} · ${p}%</div></div>${dots}</div>`);
   }
-  for (const c of gm.counters) for (const t of c.tiers) {
+  for (const c of gm.counters) for (const t of activeTiers(c)) {
     const act = tierMetDays(c, t), p = pct(act, t.goal);
     const sub = t.goal ? `${act}/${t.goal} · ${p}%` : `${act} days · no goal set`;
     const dots = Array.from({ length: gN }, (_, i) => {
@@ -385,7 +386,7 @@ function buildDraft(forYM, sourceYM) {
     rows: src ? activeHabits(src).map(h => ({ id: h.id, name: h.name, cat: h.cat, type: h.type, target: h.target, goal: h.goal, keep: true, result: `${habitActual(h)} of ${h.goal} last month` })) : [],
     counters: (src ? src.counters : []).map(c => ({
       id: c.id, name: c.name, unit: c.unit,
-      tiers: c.tiers.map(t => ({ id: t.id, label: t.label, max: t.max, goal: t.goal, result: t.goal ? `${tierMetDays(c, t)} of ${t.goal} days last month` : 'no goal set yet' }))
+      tiers: c.tiers.map(t => ({ id: t.id, label: t.label, max: t.max, goal: t.goal, archived: t.archived, result: t.goal ? `${tierMetDays(c, t)} of ${t.goal} days last month` : 'no goal set yet' }))
     })),
     added: [], quote: src ? src.quote || '' : '', notes: ''
   };
@@ -409,14 +410,18 @@ function habitRow(r) {
 function tierSection(c) {
   return `<div class="section-label plan-section-label">${esc(c.name)} tiers</div>
     <div style="display:flex; flex-direction:column; gap:8px;">` +
-    c.tiers.map(t => `<div class="plan-card">
-        <div class="info"><div class="nm">${esc(t.label)}</div><div class="rs">${esc(t.result || '')}</div></div>
-        <div class="stepper-sm">
+    c.tiers.map(t => {
+      const keep = !t.archived;
+      return `<div class="plan-card ${keep ? '' : 'dropped'}">
+        <div class="info"><div class="nm">${esc(t.label)}</div><div class="rs">${esc(keep ? (t.result || '') : 'not tracked')}</div></div>
+        ${keep ? `<div class="stepper-sm">
           <button data-action="tier-dec" data-cid="${esc(c.id)}" data-id="${esc(t.id)}">−</button>
           <div class="val">${t.goal}</div>
           <button data-action="tier-inc" data-cid="${esc(c.id)}" data-id="${esc(t.id)}">+</button></div>
-        <div class="days-lbl">days</div>
-      </div>`).join('') + `</div>`;
+        <div class="days-lbl">days</div>` : ''}
+        <button class="toggle-btn ${keep ? 'drop' : 'restore'}" data-action="tier-toggle" data-cid="${esc(c.id)}" data-id="${esc(t.id)}">${keep ? 'Drop' : 'Restore'}</button>
+      </div>`;
+    }).join('') + `</div>`;
 }
 function addForm(headline) {
   const f = S.form, counter = f.type === 'counter';
@@ -461,7 +466,7 @@ function renderPlan() {
   } else {
     const pm = DB.months[planYM];
     rows = pm.habits.map(h => ({ id: h.id, name: h.name, cat: h.cat, result: `${habitActual(h)} of ${h.goal} this month`, goal: h.goal, keep: !h.archived }));
-    counters = pm.counters.map(c => ({ id: c.id, name: c.name, tiers: c.tiers.map(t => ({ id: t.id, label: t.label, goal: t.goal, result: t.goal ? `${tierMetDays(c, t)} of ${t.goal} days this month` : 'no goal set yet' })) }));
+    counters = pm.counters.map(c => ({ id: c.id, name: c.name, tiers: c.tiers.map(t => ({ id: t.id, label: t.label, goal: t.goal, archived: t.archived, result: t.goal ? `${tierMetDays(c, t)} of ${t.goal} days this month` : 'no goal set yet' })) }));
     quote = pm.quote || ''; notes = pm.notes || '';
   }
 
@@ -572,14 +577,17 @@ function toggleHabit(id) {
     if (h) { h.archived = !h.archived; save(); }
   }
 }
-function bumpTier(cid, id, delta) {
+// Mirrors editPlanHabit but for a tier nested inside a counter.
+function editPlanTier(cid, id, apply) {
   const { planYM, isUnplanned } = resolvePlan();
   const list = isUnplanned ? S.draft.counters : DB.months[planYM].counters;
-  const t = list.find(c => c.id === cid)?.tiers.find(x => x.id === id);
-  if (!t) return;
-  t.goal = Math.max(0, t.goal + delta);
+  const tier = list.find(c => c.id === cid)?.tiers.find(x => x.id === id);
+  if (!tier) return;
+  apply(tier);
   if (!isUnplanned) save();
 }
+function bumpTier(cid, id, delta) { editPlanTier(cid, id, t => { t.goal = Math.max(0, t.goal + delta); }); }
+function toggleTier(cid, id) { editPlanTier(cid, id, t => { t.archived = !t.archived; }); }
 function addItem() {
   const f = S.form;
   if (!f.name.trim()) return;
@@ -603,7 +611,7 @@ function createPlan() {
   DB.months[draft.forYM] = {
     quote: draft.quote || '', notes: draft.notes || '',
     habits: draft.rows.concat(draft.added).filter(r => r.keep).map(r => ({ id: r.id, name: r.name, cat: r.cat, type: r.type || 'check', goal: r.goal, days: {}, ...(r.target ? { target: r.target } : {}) })),
-    counters: draft.counters.map(c => ({ id: c.id, name: c.name, unit: c.unit, days: {}, tiers: c.tiers.map(t => ({ id: t.id, label: t.label, max: t.max, goal: t.goal })) }))
+    counters: draft.counters.map(c => ({ id: c.id, name: c.name, unit: c.unit, days: {}, tiers: c.tiers.map(t => ({ id: t.id, label: t.label, max: t.max, goal: t.goal, ...(t.archived ? { archived: true } : {}) })) }))
   };
   save();
   S.planMsg = monthLabel(draft.forYM) + ' created ✓ — it now appears in Daily Log and Monthly Log';
@@ -658,6 +666,7 @@ const CLICKS = {
   'habit-toggle': { keep: true, run: el => toggleHabit(el.dataset.id) },
   'tier-inc': { keep: true, run: el => bumpTier(el.dataset.cid, el.dataset.id, 1) },
   'tier-dec': { keep: true, run: el => bumpTier(el.dataset.cid, el.dataset.id, -1) },
+  'tier-toggle': { keep: true, run: el => toggleTier(el.dataset.cid, el.dataset.id) },
   'add-item': { keep: true, run: addItem },
   'plan-create': { keep: false, run: createPlan },
   'goto-plan': { keep: false, run: () => { S.tab = 'plan'; } },
