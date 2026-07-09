@@ -1,0 +1,7 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+# Serverless functions run on Node 18+ (Web Request/Response API).
+[functions]
+  node_bundler = "esbuild"

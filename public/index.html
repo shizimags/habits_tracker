@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Habit Tracker 2026</title>
+<meta name="theme-color" content="#F7F5F0">
+<link rel="manifest" href="manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Habits">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+  <main id="view"></main>
+  <nav id="tabbar">
+    <button data-tab="log" class="tab active">Daily Log</button>
+    <button data-tab="grid" class="tab">Monthly Log</button>
+    <button data-tab="plan" class="tab">Goals</button>
+    <button data-tab="year" class="tab">Journey</button>
+  </nav>
+</div>
+<script src="config.js"></script>
+<script src="https://accounts.google.com/gsi/client" async onload="window.__gisOnLoad && window.__gisOnLoad()"></script>
+<script src="app.js"></script>
+</body>
+</html>
