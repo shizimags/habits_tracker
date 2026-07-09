@@ -550,6 +550,9 @@ function renderYear() {
       <button data-action="restore">Restore</button>
       <input type="file" accept="application/json" data-role="restore-input" data-change="restore-file" style="display:none;">
     </div>
+    <div class="danger-row">
+      <button data-action="delete-all" class="danger-btn">Delete all data</button>
+    </div>
   </div>`;
   updateAccountUI();
 }
@@ -647,6 +650,36 @@ function restoreFrom(file) {
   };
   reader.readAsText(file);
 }
+// Two-step confirmation (details, then type-to-confirm) — this destroys real
+// history with no undo, so it should be much harder to trigger than a mis-tap.
+async function deleteAllData() {
+  const monthCount = Object.keys(DB.months).length;
+  const totalChecks = Object.values(DB.months).reduce((sum, m) => {
+    const habitDays = m.habits.reduce((a, h) => a + Object.keys(h.days).length, 0);
+    const counterDays = m.counters.reduce((a, c) => a + Object.keys(c.days).length, 0);
+    return sum + habitDays + counterDays;
+  }, 0);
+  if (!monthCount) { alert('There is no data to delete.'); return; }
+  const cloudNote = AUTH.user ? ' This also erases your cloud copy — it cannot be recovered from another device afterward.' : '';
+  const ok = confirm(
+    `Delete ALL habit data?\n\n` +
+    `This permanently removes ${monthCount} month${monthCount === 1 ? '' : 's'} of history ` +
+    `(${totalChecks} logged day${totalChecks === 1 ? '' : 's'} across every habit and counter), ` +
+    `every goal, quote, and note.${cloudNote}\n\n` +
+    `This cannot be undone. Use "Back up data" first if you're not sure.`
+  );
+  if (!ok) return;
+  const typed = prompt('Type DELETE to confirm permanent deletion:');
+  if (typed !== 'DELETE') { alert('Deletion cancelled — text did not match.'); return; }
+
+  DB = { pastSummaries: {}, months: {} };
+  saveLocal();
+  S.ym = TODAY_YM; S.day = TODAY_D;
+  S.gridYM = null; S.planYM = null; S.draft = null; S.planMsg = '';
+  S.form = blankForm();
+  if (AUTH.token) await cloudPush();
+  render();
+}
 
 // Click actions. `keep` = re-render preserving scroll position (in-place edits);
 // omitted = re-render from the top (navigation between contexts).
@@ -672,7 +705,9 @@ const CLICKS = {
   'goto-plan': { keep: false, run: () => { S.tab = 'plan'; } },
   'backup': { keep: true, run: backup, skipRender: true },
   'restore': { keep: true, run: () => view.querySelector('[data-role="restore-input"]').click(), skipRender: true },
-  'signout': { keep: false, run: signOut }
+  'delete-all': { keep: true, run: deleteAllData, skipRender: true },
+  'sync-now': { keep: true, run: () => cloudPush(), skipRender: true },
+  'signout': { keep: false, run: signOutAndClearLocal, skipRender: true }
 };
 
 // Live field edits (text/number in the add form) — keep S.form current so the
@@ -733,6 +768,15 @@ view.addEventListener('change', e => {
 const CLIENT_ID = window.GOOGLE_CLIENT_ID || '';
 const AUTH = { token: null, user: null, sync: 'idle', syncError: '' };
 let cloudPushTimer = null;
+let tokenRefreshTimer = null;
+let authExpiredFallbackTimer = null;
+// Google ID tokens expire hourly. `nextCredentialMode` tells the single GIS
+// callback what to do with the credential it's about to receive: 'pull' loads
+// the account's cloud data (genuine sign-in), 'refresh' just renews the token
+// so the next save can go through — it must never touch local data, or a
+// background token renewal would silently discard whatever the user just typed.
+let nextCredentialMode = 'pull';
+const TOKEN_REFRESH_INTERVAL_MS = 45 * 60 * 1000; // well under the ~60min token lifetime
 
 function decodeJwt(t) {
   try { return JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch (e) { return null; }
@@ -756,16 +800,17 @@ async function cloudPush() {
       headers: { Authorization: 'Bearer ' + AUTH.token, 'Content-Type': 'application/json' },
       body: JSON.stringify(DB)
     });
-    if (r.status === 401) { signOut(); render(); return; }
+    if (r.status === 401) return handleAuthExpired();
     if (!r.ok) { setSync('error', 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
     setSync('synced');
   } catch (e) { setSync('error', 'offline'); }
 }
 async function cloudPull() {
+  if (!AUTH.token) return;
   setSync('saving');
   try {
     const r = await fetch('/api/state', { headers: { Authorization: 'Bearer ' + AUTH.token } });
-    if (r.status === 401) { signOut(); return; }
+    if (r.status === 401) return handleAuthExpired();
     if (!r.ok) { setSync('error', 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
     const cloud = await r.json();
     if (cloud && cloud.months) { DB = normalizeDB(cloud); saveLocal(); setSync('synced'); }
@@ -775,25 +820,73 @@ async function cloudPull() {
 async function onGoogleCredential(resp) {
   const payload = decodeJwt(resp.credential);
   if (!payload) return;
+  const mode = nextCredentialMode;
+  nextCredentialMode = 'pull'; // default back for the next unrelated sign-in
+  clearTimeout(authExpiredFallbackTimer);
   AUTH.token = resp.credential;
   AUTH.user = { email: payload.email, name: payload.name };
-  await cloudPull();
+  startTokenRefreshTimer();
+  if (mode === 'pull') {
+    await cloudPull();
+  } else {
+    // Background token renewal — data is untouched; just let any save that
+    // was waiting on a valid token go through now.
+    setSync('synced');
+    scheduleCloudPush();
+  }
   render();
 }
-function signOut() {
+// Ask Google for a fresh ID token without any visible re-sign-in step, as long
+// as the browser still has an active Google session for this user.
+function refreshTokenSilently(mode) {
+  if (!(window.google && window.google.accounts && window.google.accounts.id) || !CLIENT_ID) return false;
+  nextCredentialMode = mode;
+  google.accounts.id.prompt();
+  return true;
+}
+function startTokenRefreshTimer() {
+  clearInterval(tokenRefreshTimer);
+  tokenRefreshTimer = setInterval(() => refreshTokenSilently('refresh'), TOKEN_REFRESH_INTERVAL_MS);
+}
+function stopTokenRefreshTimer() {
+  clearInterval(tokenRefreshTimer);
+  tokenRefreshTimer = null;
+}
+// A 401 means the token expired mid-session — NOT that the user asked to sign
+// out. Local data must survive this untouched: try a silent refresh and retry
+// the sync; only fall back to showing "signed out" if that truly fails, and
+// even then nothing local is cleared (that only happens on the explicit
+// Sign Out button, see signOutAndClearLocal).
+function handleAuthExpired() {
+  const staleUser = AUTH.user;
+  setSync('error', 'Session expired — reconnecting…');
+  const attempted = refreshTokenSilently('refresh');
+  clearTimeout(authExpiredFallbackTimer);
+  authExpiredFallbackTimer = setTimeout(() => {
+    if (AUTH.user === staleUser && AUTH.sync === 'error') {
+      AUTH.token = null; AUTH.user = null;
+      stopTokenRefreshTimer();
+      setSync('idle');
+    }
+  }, attempted ? 8000 : 0);
+}
+// The explicit "Sign out" button: flush any pending edits to the cloud first
+// (so nothing typed just before signing out is lost), then clear local data —
+// this device is about to be handed to (or was shared with) someone else.
+async function signOutAndClearLocal() {
+  if (AUTH.token) { clearTimeout(cloudPushTimer); await cloudPush(); }
   AUTH.token = null;
   AUTH.user = null;
   AUTH.sync = 'idle';
   AUTH.syncError = '';
+  stopTokenRefreshTimer();
   if (window.google && window.google.accounts) window.google.accounts.id.disableAutoSelect();
-  // A signed-in account's data lives in the cloud; the local copy is just a
-  // cache for that account. Clear it on sign-out so goals don't linger on
-  // screen (or silently get adopted into) the next account signed in here.
   DB = { pastSummaries: {}, months: {} };
   saveLocal();
   S.ym = TODAY_YM; S.day = TODAY_D;
   S.gridYM = null; S.planYM = null; S.draft = null; S.planMsg = '';
   S.form = blankForm();
+  render();
 }
 function initGoogle() {
   if (!(window.google && window.google.accounts && window.google.accounts.id) || !CLIENT_ID) return;
@@ -815,7 +908,10 @@ function updateAccountUI() {
     el.innerHTML = `<div class="acct">
       <div style="min-width:0;"><div class="acct-name">${esc(AUTH.user.name || AUTH.user.email)}</div>
         <div class="acct-sub" style="color:${color}; word-break:break-word;">${esc(status)}</div></div>
-      <button class="acct-btn" data-action="signout">Sign out</button></div>`;
+      <div style="display:flex; gap:6px; flex:none;">
+        <button class="acct-btn" data-action="sync-now">Sync now</button>
+        <button class="acct-btn" data-action="signout">Sign out</button>
+      </div></div>`;
   } else {
     el.innerHTML = `<div class="acct-out">
       <div class="acct-sub">Sign in with Google to save your data and sync across devices.</div>
