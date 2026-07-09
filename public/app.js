@@ -992,6 +992,8 @@ async function signOutAndClearLocal() {
   S.ym = TODAY_YM; S.day = TODAY_D;
   S.gridYM = null; S.planYM = null; S.draft = null; S.planMsg = '';
   S.form = blankForm();
+  S.onboard = null;
+  S.onboardDismissed = false; // a fresh sign-in (maybe another person) gets the guided setup again
   render();
 }
 function initGoogle() {
