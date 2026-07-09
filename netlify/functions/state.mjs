@@ -10,12 +10,19 @@ const oauth = new OAuth2Client(CLIENT_ID);
 
 // Lazily connect so a missing env var yields a clean JSON error instead of a
 // 502 crash at module load. Netlify DB exposes both the pooled and unpooled URL.
+// Netlify DB has exposed this connection string under a couple of different
+// var names across rollouts; accept any of them rather than guessing wrong.
+const DB_URL_VARS = ['NETLIFY_DATABASE_URL', 'NETLIFY_DATABASE_URL_UNPOOLED', 'DATABASE_URL', 'NEON_DATABASE_URL'];
+function findDbUrl() {
+  for (const name of DB_URL_VARS) if (process.env[name]) return { name, url: process.env[name] };
+  return null;
+}
 let _sql, _schema;
 function db() {
   if (!_sql) {
-    const url = process.env.NETLIFY_DATABASE_URL || process.env.NETLIFY_DATABASE_URL_UNPOOLED;
-    if (!url) throw new Error('NETLIFY_DATABASE_URL is not set — is Netlify DB provisioned for this site?');
-    _sql = neon(url);
+    const found = findDbUrl();
+    if (!found) throw new Error('No database URL env var found (checked ' + DB_URL_VARS.join(', ') + ') — is Netlify DB linked to this site?');
+    _sql = neon(found.url);
   }
   return _sql;
 }
