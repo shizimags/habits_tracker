@@ -722,11 +722,16 @@ view.addEventListener('change', e => {
 // Google, their state is loaded from / saved to Netlify DB (one row per Google
 // account), so it persists and follows them across devices. Last write wins.
 const CLIENT_ID = window.GOOGLE_CLIENT_ID || '';
-const AUTH = { token: null, user: null };
+const AUTH = { token: null, user: null, sync: 'idle', syncError: '' };
 let cloudPushTimer = null;
 
 function decodeJwt(t) {
   try { return JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch (e) { return null; }
+}
+function setSync(state, err) {
+  AUTH.sync = state;
+  AUTH.syncError = err || '';
+  updateAccountUI();
 }
 function scheduleCloudPush() {
   if (!AUTH.token) return;
@@ -735,24 +740,28 @@ function scheduleCloudPush() {
 }
 async function cloudPush() {
   if (!AUTH.token) return;
+  setSync('saving');
   try {
     const r = await fetch('/api/state', {
       method: 'PUT',
       headers: { Authorization: 'Bearer ' + AUTH.token, 'Content-Type': 'application/json' },
       body: JSON.stringify(DB)
     });
-    if (r.status === 401) { signOut(); render(); }
-  } catch (e) { /* offline — retries on the next change */ }
+    if (r.status === 401) { signOut(); render(); return; }
+    if (!r.ok) { setSync('error', 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
+    setSync('synced');
+  } catch (e) { setSync('error', 'offline'); }
 }
 async function cloudPull() {
+  setSync('saving');
   try {
     const r = await fetch('/api/state', { headers: { Authorization: 'Bearer ' + AUTH.token } });
     if (r.status === 401) { signOut(); return; }
-    if (!r.ok) return;
+    if (!r.ok) { setSync('error', 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
     const cloud = await r.json();
-    if (cloud && cloud.months) { DB = normalizeDB(cloud); saveLocal(); }
-    else { cloudPush(); }  // first sign-in on this account — seed the cloud from local data
-  } catch (e) { /* offline — keep local */ }
+    if (cloud && cloud.months) { DB = normalizeDB(cloud); saveLocal(); setSync('synced'); }
+    else { await cloudPush(); }  // first sign-in on this account — seed the cloud from local data
+  } catch (e) { setSync('error', 'offline'); }
 }
 async function onGoogleCredential(resp) {
   const payload = decodeJwt(resp.credential);
@@ -779,9 +788,14 @@ function updateAccountUI() {
   const el = document.getElementById('account');
   if (!el) return;
   if (AUTH.user) {
+    const status = AUTH.sync === 'saving' ? 'Saving…'
+      : AUTH.sync === 'error' ? 'Sync error: ' + AUTH.syncError
+      : AUTH.sync === 'synced' ? 'Synced to cloud ✓'
+      : 'Signed in';
+    const color = AUTH.sync === 'error' ? 'var(--red)' : 'var(--faint)';
     el.innerHTML = `<div class="acct">
-      <div><div class="acct-name">${esc(AUTH.user.name || AUTH.user.email)}</div>
-        <div class="acct-sub">Synced to cloud ✓</div></div>
+      <div style="min-width:0;"><div class="acct-name">${esc(AUTH.user.name || AUTH.user.email)}</div>
+        <div class="acct-sub" style="color:${color}; word-break:break-word;">${esc(status)}</div></div>
       <button class="acct-btn" data-action="signout">Sign out</button></div>`;
   } else {
     el.innerHTML = `<div class="acct-out">
