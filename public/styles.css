@@ -86,6 +86,8 @@ input, textarea, select, button { font-family: 'Schibsted Grotesk', -apple-syste
 .tier-chip.met { border-color: var(--accent-tint); color: var(--accent-deep); background: var(--accent-soft); }
 .tier-chip span { opacity: 0.6; }
 .smoke-hint { text-align: center; font-size: 11px; color: var(--fainter); margin-top: 10px; }
+.carry-hint { text-align: center; font-size: 12px; color: var(--fainter); margin-top: 14px;
+  padding: 8px 12px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; }
 
 /* Monthly Log */
 .screen-grid { padding: 24px 0 28px; }

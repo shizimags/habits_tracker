@@ -12,7 +12,6 @@
 
 // ---------- Constants ----------
 const LS_KEY = 'habit-tracker-2026-v1';
-const YEAR = 2026;
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const CAT_ORDER = ['Move', 'Health', 'Food', 'Avoidance', 'Home', 'Work & Soul'];
 const HABIT_TYPES = [['check', 'Checkbox'], ['qty', 'Quantity / day'], ['time', 'Minutes / day'], ['counter', 'Counter (tiers)']];
@@ -73,6 +72,40 @@ function normalizeDB(db) {
   return db;
 }
 
+// Copy a month's plan forward: same habits, counters, tiers and goal numbers,
+// with all logging reset to empty. Anything Dropped is left behind — dropped
+// means dropped, so the new month starts with only what was being tracked.
+function carryMonthForward(src, fromYM) {
+  return {
+    quote: src.quote || '', notes: '', carriedFrom: fromYM,
+    habits: activeHabits(src).map(h => ({
+      id: h.id, name: h.name, cat: h.cat, type: h.type, goal: h.goal,
+      ...(h.target ? { target: h.target } : {}), days: {}
+    })),
+    counters: src.counters.map(c => ({
+      id: c.id, name: c.name, unit: c.unit, days: {},
+      tiers: activeTiers(c).map(t => ({ id: t.id, label: t.label, max: t.max, goal: t.goal }))
+    })).filter(c => c.tiers.length)
+  };
+}
+// A new month must never dead-end the Daily Log. If goals were never set for the
+// current month, carry the most recent earlier month's plan forward — and fill
+// any months skipped in between, so the chain stays unbroken.
+function ensureCurrentMonth() {
+  if (DB.months[TODAY_YM]) return false;
+  const prior = monthKeysSorted().filter(k => k < TODAY_YM);
+  if (!prior.length) return false;
+  const from = DB.months[prior[prior.length - 1]];
+  // Nothing worth carrying — leave the month unset so the Daily Log's "set up"
+  // prompt shows instead of an empty month with nothing to log.
+  if (!activeHabits(from).length && !from.counters.some(c => activeTiers(c).length)) return false;
+  for (let ym = nextYM(prior[prior.length - 1]); ym <= TODAY_YM; ym = nextYM(ym)) {
+    const srcYM = prevYM(ym);
+    DB.months[ym] = carryMonthForward(DB.months[srcYM], srcYM);
+  }
+  return true;
+}
+
 let DB = null;
 function saveLocal() { try { localStorage.setItem(LS_KEY, JSON.stringify(DB)); } catch (e) {} }
 function save() { saveLocal(); scheduleCloudPush(); }
@@ -80,12 +113,14 @@ async function loadDB() {
   try { DB = JSON.parse(localStorage.getItem(LS_KEY)); } catch (e) {}
   if (!DB) DB = { pastSummaries: {}, months: {} };  // fresh install starts empty
   DB = normalizeDB(DB);
+  ensureCurrentMonth();
   save();
 }
 
 // ---------- View state ----------
 const now = new Date();
-const TODAY_YM = ymOf(now.getFullYear(), now.getMonth() + 1);
+const TODAY_Y = now.getFullYear();
+const TODAY_YM = ymOf(TODAY_Y, now.getMonth() + 1);
 const TODAY_D = now.getDate();
 function isToday(ym, day) { return ym === TODAY_YM && day === TODAY_D; }
 function blankForm() { return { name: '', cat: 'Move', type: 'check', target: 10, goal: 5, unit: '', limits: DEFAULT_TIER_LIMITS }; }
@@ -94,6 +129,7 @@ const S = {
   tab: 'log',
   ym: TODAY_YM, day: TODAY_D,   // Daily Log cursor
   gridYM: null,                 // Monthly Log cursor
+  yearY: null,                  // Journey cursor (year number)
   planYM: null, draft: null, planMsg: '',
   form: blankForm(),
   onboard: null,                // active onboarding wizard state, or null
@@ -131,7 +167,7 @@ function renderLog() {
   const { ym, day } = S;
   const m = DB.months[ym];
   const [y, mm] = ym.split('-').map(Number);
-  const dateLabel = new Date(y, mm - 1, day).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  const dateLabel = new Date(y, mm - 1, day).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
 
   const head = `<div class="nav-row">
       <button class="nav-btn" data-action="day-prev">‹</button>
@@ -167,7 +203,10 @@ function renderLog() {
       }).join('') + `</div></div>`;
   }).join('');
 
-  const counters = m.counters.map(c => {
+  // A counter whose tiers have all been dropped in Goals is no longer tracked —
+  // hide its card here the way activeHabits() hides a dropped habit. Nothing is
+  // deleted, so restoring a tier brings the card and its logged days back.
+  const counters = m.counters.filter(c => activeTiers(c).length).map(c => {
     const cv = c.days[day], has = cv != null;
     const tiers = activeTiers(c).map(t => {
       const met = has && cv <= t.max;
@@ -187,6 +226,7 @@ function renderLog() {
   }).join('');
 
   view.innerHTML = `<div class="screen">${head}
+    ${m.carriedFrom ? `<div class="carry-hint">Goals carried over from ${esc(monthLabel(m.carriedFrom))} — adjust them in Goals</div>` : ''}
     ${m.quote ? `<div class="quote-serif">“${esc(m.quote)}”</div>` : ''}
     <div class="day-progress">
       <div class="track"><div class="fill" style="width:${pct(doneCount, active.length)}%"></div></div>
@@ -285,7 +325,15 @@ function planMonthList() {
   const keys = monthKeysSorted();
   const set = new Set(keys);
   set.add(TODAY_YM);                                        // always allow planning the current month
-  set.add(nextYM(keys.length ? keys[keys.length - 1] : TODAY_YM)); // and the month after the latest
+  const latest = keys.length ? keys[keys.length - 1] : TODAY_YM;
+  // The horizon runs one month past the furthest month in view — not just past
+  // the furthest *created* one. A month being drafted isn't in DB.months yet, so
+  // anchoring to `latest` alone dead-ends "›" on the first month you haven't
+  // pressed Create on, making everything after it (including the next year)
+  // unreachable. Walking forward always stays possible from wherever you are.
+  const furthest = S.planYM && S.planYM > latest ? S.planYM : latest;
+  set.add(furthest);
+  set.add(nextYM(furthest));
   return [...set].sort();
 }
 // Resolve which month the Goals tab is editing, derived purely from state so
@@ -396,7 +444,9 @@ function renderPlan() {
   const headline = (isUnplanned ? 'Plan ' : 'Goals — ') + monthLabel(planYM);
   const subline = isUnplanned
     ? 'New month — carried forward from ' + (latestYM !== planYM && DB.months[latestYM] ? monthLabel(latestYM) : 'scratch')
-    : 'Adjust goals for a month already in progress';
+    : DB.months[planYM].carriedFrom
+      ? 'Carried over from ' + monthLabel(DB.months[planYM].carriedFrom) + ' — adjust as needed'
+      : 'Adjust goals for a month already in progress';
 
   view.innerHTML = `<div class="screen">
     <div class="nav-row">
@@ -420,21 +470,49 @@ function renderPlan() {
 }
 
 // ---------- JOURNEY ----------
+// Every year stands on its own: rows, totals, best month and milestones are all
+// computed from that year's months only. The arrows span the years you actually
+// have data for (plus the current one), so 2027 shows up as soon as you create a
+// 2027 month in Goals — or when the calendar rolls over.
+function journeyYears() {
+  const set = new Set([TODAY_Y]);
+  for (const k of Object.keys(DB.months)) set.add(Number(k.slice(0, 4)));
+  for (const k of Object.keys(DB.pastSummaries)) set.add(Number(k.slice(0, 4)));
+  const ys = [...set].filter(Number.isFinite).sort((a, b) => a - b);
+  const out = [];                                    // fill any gap so ‹ › step year by year
+  for (let y = ys[0]; y <= ys[ys.length - 1]; y++) out.push(y);
+  return out;
+}
+function resolveYear() {
+  const years = journeyYears();
+  const y = years.includes(S.yearY) ? S.yearY : (years.includes(TODAY_Y) ? TODAY_Y : years[years.length - 1]);
+  return { years, y, yi: years.indexOf(y) };
+}
+
 function renderYear() {
+  const { years, y: viewY, yi } = resolveYear();
+  S.yearY = viewY;
+
   const yearRows = [];
   let totalDone = 0, totalGoal = 0, best = { name: '—', rate: 0 };
   for (let i = 1; i <= 12; i++) {
-    const k = ymOf(YEAR, i);
-    if (k > TODAY_YM) continue;
+    const k = ymOf(viewY, i);
     const src = DB.months[k] ? monthStats(k) : DB.pastSummaries[k];
     if (!src) continue;
+    const future = k > TODAY_YM;                     // planned but not yet arrived
     const rate = src.goal ? src.done / src.goal : 0;
     totalDone += src.done; totalGoal += src.goal;
     if (rate > best.rate && src.done > 0) best = { name: MONTH_NAMES[i - 1], rate };
     const p = Math.round(rate * 100);
-    yearRows.push({ name: MONTH_NAMES[i - 1].slice(0, 3), doneGoal: `${src.done}/${src.goal}`, rate: p + '%', rateColor: pctColor(p), barW: Math.min(100, p), barColor: p >= 80 ? ACCENT : p >= 50 ? BAR_MID : BAR_LOW });
+    yearRows.push({
+      name: MONTH_NAMES[i - 1].slice(0, 3), doneGoal: `${src.done}/${src.goal}`, rate: p + '%',
+      rateColor: future ? 'var(--faint)' : pctColor(p), barW: Math.min(100, p),
+      barColor: future ? 'var(--track-2)' : p >= 80 ? ACCENT : p >= 50 ? BAR_MID : BAR_LOW, future
+    });
   }
-  const doyToday = dayOfYear(TODAY_YM, TODAY_D);
+  // Days elapsed *within the viewed year* — a finished year is measured against
+  // its full length, the current one against today, a planned one against nothing.
+  const elapsed = viewY < TODAY_Y ? daysInYear(viewY) : viewY === TODAY_Y ? dayOfYear(TODAY_YM, TODAY_D) : 0;
   const overall = totalGoal ? Math.round((totalDone / totalGoal) * 100) : 0;
   const milestones = MILESTONE_THRESHOLDS.map(n => ({ label: `🏆 ${n} habits completed`, ok: totalDone >= n }));
   milestones.push({ label: '🌟 80% overall rate', ok: totalGoal > 0 && totalDone / totalGoal >= 0.8 });
@@ -445,14 +523,14 @@ function renderYear() {
       <div class="metric-card"><div class="v">${totalDone}</div><div class="l">habits completed</div></div>
       <div class="metric-card"><div class="v">${totalGoal ? overall + '%' : '—'}</div><div class="l">overall rate</div></div>
       <div class="metric-card"><div class="v sm">${esc(best.name)}${best.rate ? ' · ' + Math.round(best.rate * 100) + '%' : ''}</div><div class="l">best month</div></div>
-      <div class="metric-card"><div class="v">${doyToday ? (totalDone / doyToday).toFixed(1) : '0.0'}</div><div class="l">avg tasks / day</div></div>
+      <div class="metric-card"><div class="v">${elapsed ? (totalDone / elapsed).toFixed(1) : '—'}</div><div class="l">avg tasks / day</div></div>
     </div>
     <div class="section-label plan-section-label">Months</div>
-    <div class="list-card">${yearRows.map(y => `<div class="month-row">
-        <div class="mn">${esc(y.name)}</div>
-        <div class="bar"><i style="width:${y.barW}%; background:${y.barColor};"></i></div>
-        <div class="dg">${esc(y.doneGoal)}</div>
-        <div class="rt" style="color:${y.rateColor}">${esc(y.rate)}</div>
+    <div class="list-card">${yearRows.map(r => `<div class="month-row"${r.future ? ' style="opacity:0.45;"' : ''}>
+        <div class="mn">${esc(r.name)}</div>
+        <div class="bar"><i style="width:${r.barW}%; background:${r.barColor};"></i></div>
+        <div class="dg">${esc(r.doneGoal)}</div>
+        <div class="rt" style="color:${r.rateColor}">${esc(r.rate)}</div>
       </div>`).join('')}</div>
     <div class="section-label plan-section-label">Milestones</div>
     <div class="list-card">${milestones.map(x => `<div class="mile-row">
@@ -463,9 +541,19 @@ function renderYear() {
         <div class="empty-sub" style="font-size:15px;">Your journey starts once you log your first habit. Milestones and month-over-month stats will build up here.</div>
       </div>`;
 
+  const sub = viewY === TODAY_Y ? `Day ${elapsed} of ${daysInYear(viewY)}`
+    : viewY < TODAY_Y ? `${daysInYear(viewY)} days · complete`
+    : `${daysInYear(viewY)} days · planned`;
+
   view.innerHTML = `<div class="screen">
-    <div style="font-size:20px; font-weight:700; color:var(--ink);">${YEAR}</div>
-    <div style="font-size:13px; color:var(--sub); margin-top:2px;">Day ${doyToday} of ${daysInYear(YEAR)}</div>
+    <div class="nav-row">
+      <button class="nav-btn sm" data-action="year-prev" style="opacity:${yi > 0 ? '1' : '0.35'}">‹</button>
+      <div style="text-align:center;">
+        <div style="font-size:20px; font-weight:700; color:var(--ink);">${viewY}</div>
+        <div style="font-size:13px; color:var(--sub); margin-top:2px;">${esc(sub)}</div>
+      </div>
+      <button class="nav-btn sm" data-action="year-next" style="opacity:${yi < years.length - 1 ? '1' : '0.35'}">›</button>
+    </div>
     <div class="account-card" id="account"></div>
     ${body}
     <div class="backup-row">
@@ -568,7 +656,7 @@ function restoreFrom(file) {
   reader.onload = () => {
     try {
       const parsed = JSON.parse(reader.result);
-      if (parsed && parsed.months) { DB = normalizeDB(parsed); save(); S.draft = null; render(); }
+      if (parsed && parsed.months) { DB = normalizeDB(parsed); ensureCurrentMonth(); save(); S.draft = null; render(); }
     } catch (e) {}
   };
   reader.readAsText(file);
@@ -749,6 +837,8 @@ const CLICKS = {
   'grid-prev': { keep: false, run: () => { const k = monthKeysSorted(), i = k.indexOf(S.gridYM); if (i > 0) S.gridYM = k[i - 1]; } },
   'grid-next': { keep: false, run: () => { const k = monthKeysSorted(), i = k.indexOf(S.gridYM); if (i < k.length - 1) S.gridYM = k[i + 1]; } },
   'dot-tap': { keep: true, run: el => tapHabit(S.gridYM, el.dataset.hid, Number(el.dataset.day)) },
+  'year-prev': { keep: false, run: () => { const { years, yi } = resolveYear(); if (yi > 0) S.yearY = years[yi - 1]; } },
+  'year-next': { keep: false, run: () => { const { years, yi } = resolveYear(); if (yi < years.length - 1) S.yearY = years[yi + 1]; } },
   'plan-prev': { keep: false, run: () => { const { list, pi } = resolvePlan(); if (pi > 0) { S.planYM = list[pi - 1]; S.draft = null; S.planMsg = ''; } } },
   'plan-next': { keep: false, run: () => { const { list, pi } = resolvePlan(); if (pi < list.length - 1) { S.planYM = list[pi + 1]; S.draft = null; S.planMsg = ''; } } },
   'goal-inc': { keep: true, run: el => bumpGoal(el.dataset.id, 1) },
@@ -923,7 +1013,10 @@ async function cloudPull() {
     if (r.status === 401) return handleAuthExpired();
     if (!r.ok) { setSync('error', 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
     const cloud = await r.json();
-    if (cloud && cloud.months) { DB = normalizeDB(cloud); saveLocal(); setSync('synced'); }
+    // Cloud data can be a month behind (last synced from a device that never saw
+    // the rollover), so carry forward here too. saveLocal only — the next edit
+    // pushes it up, avoiding a write straight back into the pull we just did.
+    if (cloud && cloud.months) { DB = normalizeDB(cloud); ensureCurrentMonth(); saveLocal(); setSync('synced'); }
     else { await cloudPush(); }  // first sign-in on this account — seed the cloud from local data
   } catch (e) { setSync('error', 'offline'); }
 }
