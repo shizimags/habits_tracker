@@ -1,7 +1,7 @@
 'use strict';
 
 /* ============================================================================
-   Habit Tracker 2026 — local-first PWA
+   Habit Tracker — local-first PWA
    Architecture:
      - Single source of truth: `DB` (persisted to localStorage), `S` (view state).
      - Pure render: each tab renders its screen from state into #view.
@@ -122,6 +122,7 @@ const now = new Date();
 const TODAY_Y = now.getFullYear();
 const TODAY_YM = ymOf(TODAY_Y, now.getMonth() + 1);
 const TODAY_D = now.getDate();
+document.title = 'Habit Tracker ' + TODAY_Y;
 function isToday(ym, day) { return ym === TODAY_YM && day === TODAY_D; }
 function blankForm() { return { name: '', cat: 'Move', type: 'check', target: 10, goal: 5, unit: '', limits: DEFAULT_TIER_LIMITS }; }
 
@@ -688,7 +689,7 @@ async function deleteAllData() {
   S.ym = TODAY_YM; S.day = TODAY_D;
   S.gridYM = null; S.planYM = null; S.draft = null; S.planMsg = '';
   S.form = blankForm();
-  if (AUTH.token) await cloudPush();
+  if (AUTH.user) await cloudPush();
   render();
 }
 
@@ -912,74 +913,43 @@ view.addEventListener('change', e => {
 });
 
 // ---------- Cloud sync: Google Sign-In + Netlify DB ----------
-// The app works fully offline from localStorage. When a user signs in with
-// Google, their state is loaded from / saved to Netlify DB (one row per Google
-// account), so it persists and follows them across devices. Last write wins.
+// The app works fully offline from localStorage. Google sign-in happens once:
+// the server verifies the Google credential and sets its own HttpOnly session
+// cookie (90 days, renewed while the app is in use), so there is no hourly
+// Google token to keep refreshing. State is loaded from / saved to Netlify DB
+// (one row per Google account) and follows the user across devices. Last write wins.
 const CLIENT_ID = window.GOOGLE_CLIENT_ID || '';
+// Only the display identity is kept in localStorage, so the account card shows
+// instantly on boot. The session itself is the cookie, which JS can't read.
 const AUTH_KEY = 'habit-tracker-auth-v1';
-const AUTH = { token: null, user: null, sync: 'idle', syncError: '' };
+const AUTH = { user: null, sync: 'idle', syncError: '' };
 let cloudPushTimer = null;
-let tokenRefreshTimer = null;
-let authExpiredFallbackTimer = null;
-// Google ID tokens expire hourly. `nextCredentialMode` tells the single GIS
-// callback what to do with the credential it's about to receive: 'pull' loads
-// the account's cloud data (genuine sign-in), 'refresh' just renews the token
-// so the next save can go through — it must never touch local data, or a
-// background token renewal would silently discard whatever the user just typed.
-let nextCredentialMode = 'pull';
-const TOKEN_REFRESH_INTERVAL_MS = 45 * 60 * 1000; // well under the ~60min token lifetime
 
-function decodeJwt(t) {
-  try { return JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); } catch (e) { return null; }
-}
-// The session must survive page refreshes: keep the token + user in
-// localStorage and restore them on boot. Without this, every reload threw the
-// in-memory session away and gambled on Google One Tap silently re-signing in,
-// which browsers frequently suppress (cooldowns, Safari/ITP) — showing the
-// user a spurious "signed out" screen.
 function persistAuth() {
-  try { localStorage.setItem(AUTH_KEY, JSON.stringify({ token: AUTH.token, user: AUTH.user })); } catch (e) {}
+  try { localStorage.setItem(AUTH_KEY, JSON.stringify({ user: AUTH.user })); } catch (e) {}
 }
 function clearPersistedAuth() {
   try { localStorage.removeItem(AUTH_KEY); } catch (e) {}
 }
-function tokenValid(token) {
-  const p = token && decodeJwt(token);
-  return !!(p && p.exp && p.exp * 1000 > Date.now() + 60000); // 60s safety margin
-}
+// Boot: if this device was signed in, show the account right away, then confirm
+// with the server that the session cookie is still valid (which also renews it).
+// A device that was signed out stays signed out, even if a cookie lingers.
 function restoreSession() {
   let stored = null;
   try { stored = JSON.parse(localStorage.getItem(AUTH_KEY)); } catch (e) {}
   if (!stored || !stored.user) return;
   AUTH.user = stored.user;
-  if (tokenValid(stored.token)) {
-    AUTH.token = stored.token;
-    AUTH.sync = 'synced';
-    startTokenRefreshTimer();
-    cloudPull().then(maybeStartOnboarding); // background refresh; guided setup if the account is empty
-  } else {
-    // Token expired while the app was closed: show "Reconnecting…" and wait —
-    // initGoogle() will silently request a fresh token once the Google script
-    // is up (mode 'pull', so the fresh sign-in loads the cloud copy rather
-    // than pushing possibly-stale local data). Never touches local data.
-    AUTH.sync = 'error';
-    AUTH.syncError = 'Reconnecting…';
-    nextCredentialMode = 'pull';
-  }
+  verifySession();
 }
-// If a reconnect attempt goes unanswered (no Google session, dismissed prompt),
-// drop to the signed-out card after a grace period — without clearing data.
-function armAuthFallback() {
-  const staleUser = AUTH.user;
-  clearTimeout(authExpiredFallbackTimer);
-  authExpiredFallbackTimer = setTimeout(() => {
-    if (AUTH.user === staleUser && !AUTH.token) {
-      AUTH.user = null;
-      stopTokenRefreshTimer();
-      clearPersistedAuth();
-      setSync('idle');
-    }
-  }, 8000);
+async function verifySession() {
+  let r;
+  try { r = await fetch('/api/session'); } catch (e) { setSync('error', 'offline'); return; }
+  if (r.status === 401) return handleSessionEnded();
+  if (!r.ok) { setSync('error', 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
+  AUTH.user = (await r.json()).user;
+  persistAuth();
+  await cloudPull();
+  maybeStartOnboarding(); // guided setup if the account is empty
 }
 function setSync(state, err) {
   AUTH.sync = state;
@@ -987,30 +957,30 @@ function setSync(state, err) {
   updateAccountUI();
 }
 function scheduleCloudPush() {
-  if (!AUTH.token) return;
+  if (!AUTH.user) return;
   clearTimeout(cloudPushTimer);
   cloudPushTimer = setTimeout(cloudPush, 800);
 }
 async function cloudPush() {
-  if (!AUTH.token) return;
+  if (!AUTH.user) return;
   setSync('saving');
   try {
     const r = await fetch('/api/state', {
       method: 'PUT',
-      headers: { Authorization: 'Bearer ' + AUTH.token, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(DB)
     });
-    if (r.status === 401) return handleAuthExpired();
+    if (r.status === 401) return handleSessionEnded();
     if (!r.ok) { setSync('error', 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
     setSync('synced');
   } catch (e) { setSync('error', 'offline'); }
 }
 async function cloudPull() {
-  if (!AUTH.token) return;
+  if (!AUTH.user) return;
   setSync('saving');
   try {
-    const r = await fetch('/api/state', { headers: { Authorization: 'Bearer ' + AUTH.token } });
-    if (r.status === 401) return handleAuthExpired();
+    const r = await fetch('/api/state');
+    if (r.status === 401) return handleSessionEnded();
     if (!r.ok) { setSync('error', 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
     const cloud = await r.json();
     // Cloud data can be a month behind (last synced from a device that never saw
@@ -1020,65 +990,42 @@ async function cloudPull() {
     else { await cloudPush(); }  // first sign-in on this account — seed the cloud from local data
   } catch (e) { setSync('error', 'offline'); }
 }
+// The Google button's callback: hand the one-time Google credential to the
+// server, which verifies it and sets the 90-day session cookie.
 async function onGoogleCredential(resp) {
-  const payload = decodeJwt(resp.credential);
-  if (!payload) return;
-  const mode = nextCredentialMode;
-  nextCredentialMode = 'pull'; // default back for the next unrelated sign-in
-  clearTimeout(authExpiredFallbackTimer);
-  AUTH.token = resp.credential;
-  AUTH.user = { email: payload.email, name: payload.name };
+  try {
+    const r = await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential: resp.credential })
+    });
+    if (!r.ok) { setSync('idle', 'Sign-in failed: HTTP ' + r.status + ' ' + (await r.text()).slice(0, 140)); return; }
+    AUTH.user = (await r.json()).user;
+  } catch (e) { setSync('idle', 'Sign-in failed: offline'); return; }
   persistAuth();
-  startTokenRefreshTimer();
-  if (mode === 'pull') {
-    await cloudPull();
-    maybeStartOnboarding(); // brand-new account (no months anywhere) → guided setup
-  } else {
-    // Background token renewal — data is untouched; just let any save that
-    // was waiting on a valid token go through now.
-    setSync('synced');
-    scheduleCloudPush();
-  }
+  await cloudPull();
+  maybeStartOnboarding(); // brand-new account (no months anywhere) → guided setup
   render();
 }
-// Ask Google for a fresh ID token without any visible re-sign-in step, as long
-// as the browser still has an active Google session for this user.
-function refreshTokenSilently(mode) {
-  if (!(window.google && window.google.accounts && window.google.accounts.id) || !CLIENT_ID) return false;
-  nextCredentialMode = mode;
-  google.accounts.id.prompt();
-  return true;
-}
-function startTokenRefreshTimer() {
-  clearInterval(tokenRefreshTimer);
-  tokenRefreshTimer = setInterval(() => refreshTokenSilently('refresh'), TOKEN_REFRESH_INTERVAL_MS);
-}
-function stopTokenRefreshTimer() {
-  clearInterval(tokenRefreshTimer);
-  tokenRefreshTimer = null;
-}
-// A 401 means the token expired mid-session — NOT that the user asked to sign
-// out. Local data must survive this untouched: try a silent refresh and retry
-// the sync; only fall back to showing "signed out" if that truly fails, and
-// even then nothing local is cleared (that only happens on the explicit
-// Sign Out button, see signOutAndClearLocal).
-function handleAuthExpired(mode = 'refresh') {
-  AUTH.token = null; // token is dead after a 401; onGoogleCredential re-sets it
-  setSync('error', 'Session expired — reconnecting…');
-  refreshTokenSilently(mode);
-  armAuthFallback();
+// A 401 means the session cookie is gone or expired (90 days unused) — NOT that
+// the user asked to sign out. Show the sign-in button again; local data is left
+// untouched (only the explicit Sign out button clears it, see signOutAndClearLocal).
+function handleSessionEnded() {
+  clearTimeout(cloudPushTimer);
+  AUTH.user = null;
+  clearPersistedAuth();
+  setSync('idle', 'Your session ended — sign in again to keep syncing.');
 }
 // The explicit "Sign out" button: flush any pending edits to the cloud first
 // (so nothing typed just before signing out is lost), then clear local data —
 // this device is about to be handed to (or was shared with) someone else.
 async function signOutAndClearLocal() {
-  if (AUTH.token) { clearTimeout(cloudPushTimer); await cloudPush(); }
-  AUTH.token = null;
+  if (AUTH.user) { clearTimeout(cloudPushTimer); await cloudPush(); }
+  try { await fetch('/api/session', { method: 'DELETE' }); } catch (e) {}
   AUTH.user = null;
   AUTH.sync = 'idle';
   AUTH.syncError = '';
   clearPersistedAuth();
-  stopTokenRefreshTimer();
   if (window.google && window.google.accounts) window.google.accounts.id.disableAutoSelect();
   DB = { pastSummaries: {}, months: {} };
   saveLocal();
@@ -1091,14 +1038,7 @@ async function signOutAndClearLocal() {
 }
 function initGoogle() {
   if (!(window.google && window.google.accounts && window.google.accounts.id) || !CLIENT_ID) return;
-  google.accounts.id.initialize({ client_id: CLIENT_ID, callback: onGoogleCredential, auto_select: true });
-  // Only nudge Google when we actually need a token: a restored session that
-  // expired while the app was closed. A valid restored session needs nothing,
-  // and a signed-out user gets the explicit button instead of a popup.
-  if (AUTH.user && !AUTH.token) {
-    google.accounts.id.prompt();
-    armAuthFallback();
-  }
+  google.accounts.id.initialize({ client_id: CLIENT_ID, callback: onGoogleCredential });
   updateAccountUI();
 }
 window.__gisOnLoad = initGoogle;
@@ -1122,6 +1062,7 @@ function updateAccountUI() {
   } else {
     el.innerHTML = `<div class="acct-out">
       <div class="acct-sub">Sign in with Google to save your data and sync across devices.</div>
+      ${AUTH.syncError ? `<div class="acct-sub" style="color:var(--red);">${esc(AUTH.syncError)}</div>` : ''}
       <div id="gbtn"></div></div>`;
     if (window.google && window.google.accounts && CLIENT_ID) {
       google.accounts.id.renderButton(document.getElementById('gbtn'), { theme: 'outline', size: 'large', text: 'signin_with', shape: 'pill' });
