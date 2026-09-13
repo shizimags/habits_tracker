@@ -1,4 +1,4 @@
-# Habit Tracker 2026
+# Habit Tracker
 
 Local-first habit tracker (PWA) with optional **Google Sign-In** and **Netlify DB** (Postgres) sync.
 Works fully offline from `localStorage`; when signed in, each user's data is saved to one row in Postgres and follows them across devices.
@@ -18,7 +18,8 @@ package.json            function deps (@neondatabase/serverless, google-auth-lib
 
 1. **Connect this repo** to your Netlify site (Site → Build & deploy → link repository). Netlify installs deps and deploys automatically on push.
 2. **Add Netlify DB** (Site → Integrations/Extensions → Netlify DB, or `netlify db init`). It provisions Neon Postgres and sets `NETLIFY_DATABASE_URL` automatically. The `user_state` table is created on first request — no migration needed.
-3. **Google OAuth**: the client ID is in `public/config.js` and `netlify/functions/state.mjs`. In Google Cloud Console, ensure the site URL is an **Authorized JavaScript origin**, and add your testers as **Test users** (or publish the consent screen).
+3. **Session secret**: add an environment variable `SESSION_SECRET` (a random string, 32+ characters — e.g. `openssl rand -base64 48`) under Site configuration → Environment variables, then redeploy. It signs the 90-day login cookie; changing it signs everyone out.
+4. **Google OAuth**: the client ID is in `public/config.js` and `netlify/functions/session.mjs`. In Google Cloud Console, ensure the site URL is an **Authorized JavaScript origin**, and add your testers as **Test users** (or publish the consent screen).
 
 ## Data model
 
